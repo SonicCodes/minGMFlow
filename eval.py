@@ -59,7 +59,8 @@ class Eval:
     def __init__(self):
         # initialize dinov2 model
         from transformers import AutoModel, AutoImageProcessor
-        local_rank = torch.distributed.get_rank()
+        import os
+        local_rank = int(os.environ["LOCAL_RANK"])#torch.distributed.get_rank()
         if local_rank == 0:
             self.processor = AutoImageProcessor.from_pretrained('facebook/dinov2-large')
             self.model = AutoModel.from_pretrained('facebook/dinov2-large').bfloat16()

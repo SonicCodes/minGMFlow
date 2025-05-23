@@ -175,17 +175,18 @@ def gm_kl_loss(model_output, target, eps=1e-4):
 @click.option("--run_name", default="run_1", help="Name of the run")
 @click.option("--global_batch_size", default=256, help="Global batch size across all GPUs")
 @click.option("--global_seed", default=4, help="Global seed")
-@click.option("--per_gpu_batch_size", default=32, help="Per GPU batch size")
+@click.option("--per_gpu_batch_size", default=16, help="Per GPU batch size")
 @click.option("--num_iterations", default=500_000, help="Number of training iterations")
+@click.option("--optimizer", default="adamw", help="Optimizer")
 @click.option("--learning_rate", default=1e-4, help="Learning rate")
-@click.option("--sample_every", default=10_000, help="Sample frequency")
+@click.option("--sample_every", default=4_000, help="Sample frequency")
 @click.option("--val_every", default=2_000, help="Validation frequency")
-@click.option("--kdd_every", default=2_000, help="KDD evaluation frequency")
+@click.option("--kdd_every", default=1_000, help="KDD evaluation frequency")
 @click.option("--save_every", default=2_000, help="Checkpoint save frequency")
-@click.option("--init_ckpt", default=None, help="Path to initial checkpoint")
+@click.option("--init_ckpt", default="/mnt/shareddir/test1/logs/ckpts_2025-04-12_20-02-14_run_1/step_488000.pt", help="Path to initial checkpoint")
 @click.option("--cfg_scale", default=1.5, help="CFG scale during KDD evaluation")
 @click.option("--uncond_prob", default=0.1, help="Probability of dropping label for unconditional training")
-def main(run_name, global_batch_size, global_seed, per_gpu_batch_size, num_iterations,
+def main(run_name, global_batch_size, global_seed, per_gpu_batch_size, num_iterations, optimizer,
          learning_rate, sample_every, val_every, kdd_every, save_every, init_ckpt, cfg_scale, uncond_prob):
 
     ddp_rank = int(os.environ["RANK"])
@@ -240,22 +241,24 @@ def main(run_name, global_batch_size, global_seed, per_gpu_batch_size, num_itera
     torch.backends.cudnn.allow_tf32 = True
     torch.backends.cudnn.benchmark = True
 
-    model = GMSiT_models['GMSiT-B/2']().to(memory_format=torch.channels_last)  # From your code
+    model = GMSiT_models['GMSiT-XL/2']().to(memory_format=torch.channels_last)  # From your code
     
     # ema model
     ema = copy.deepcopy(model)
+    # ema 
+    if init_ckpt is not None:
+        print(f"Loading checkpoint from {init_ckpt}")
+    if init_ckpt is not None:
+        checkpoint = torch.load(init_ckpt, map_location="cpu")
+        model.load_state_dict({k.replace("module.", "").replace("_orig_mod.", ""): v for k, v in checkpoint["model"].items()})
+        ema.load_state_dict({k.replace("module.", "").replace("_orig_mod.", ""): v for k, v in checkpoint["ema"].items()})
+
+    
     model = torch.compile(model)
     ema = torch.compile(ema)
     model = model.to(device)
     ema = ema.to(device)    
     requires_grad(ema, False)
-    # ema 
-    if init_ckpt is not None and master_process:
-        print(f"Loading checkpoint from {init_ckpt}")
-    if init_ckpt is not None:
-        checkpoint = torch.load(init_ckpt, map_location="cpu")
-        model.load_state_dict(checkpoint["model"])
-        ema.load_state_dict(checkpoint["ema"])
 
     random_tensor = torch.ones(1000, 1000, device=device) * ddp_rank
     dist.all_reduce(random_tensor, op=dist.ReduceOp.SUM)
@@ -264,12 +267,32 @@ def main(run_name, global_batch_size, global_seed, per_gpu_batch_size, num_itera
 
     # Wrap in DDP
     model = DDP(model, device_ids=[ddp_local_rank], find_unused_parameters=False)
+    if optimizer == "adamw":
+        optimizer = torch.optim.AdamW(
+            model.parameters(),
+            lr=learning_rate,
+            weight_decay=0
+        )
+    elif optimizer == "muon":
+        from muon import Muon
+        adamw_params, muon_params = [], []
+        for name, param in model.named_parameters():
+            if param.requires_grad:
+                if (param.ndim >= 2) and ("final_layer" not in name) and ("x_embedder" not in name):
+                    muon_params.append(param)
+                else:
+                    adamw_params.append(param)
+        optimizer = Muon(
+            muon_params=muon_params,
+            lr=learning_rate*4,
+            adamw_params=adamw_params,
+            adamw_lr=learning_rate,
+            adamw_wd=0
+        )
 
-    optimizer = torch.optim.AdamW(
-        model.parameters(),
-        lr=learning_rate,
-        weight_decay=0
-    )
+    # if init_ckpt is not None:
+    #     optimizer.load_state_dict(checkpoint["optimizer"])
+    # first 4k steps same lr, but within the next 10k steps i want to reduce lr by 100x
 
     enable_cudnn_sdp(True)
     enable_flash_sdp(True)
@@ -489,6 +512,7 @@ def main(run_name, global_batch_size, global_seed, per_gpu_batch_size, num_itera
         
         clip_grad_norm_(model.parameters(), max_norm=1.0)  # or any suitable value
         optimizer.step()
+        # lr_scheduler.step()/
         # ema beta should be 0 for first 10k steps and then annealed to 0.999 within 100k steps
         ema_beta = 0.0 if (step < 10000) else 0.999
         update_ema(ema, model.module, ema_beta)
@@ -498,6 +522,7 @@ def main(run_name, global_batch_size, global_seed, per_gpu_batch_size, num_itera
         if master_process and step % 10 == 0:
             wandb.log({
                 "train/loss": np.mean(running_loss),
+                "train/lr": optimizer.param_groups[0]["lr"]
             }, step=step)
             running_loss = []
         # Validation

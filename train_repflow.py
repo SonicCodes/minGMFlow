@@ -5,7 +5,7 @@ os.environ["WANDB_KEY"] = "017a2798d0b6bc80eecaa69d5f85b84cd4ca556f"
 os.environ["PROJECT"] = "diff-fal"
 os.environ["ENTITY"] = "r21"
 
-from vdit import SiT_models
+from vdit_rep import SiT_models
 from eval import Eval
 import click
 import torch
@@ -171,9 +171,8 @@ def update_ema(ema_model, model, decay=0.9999):
 @click.option("--init_ckpt", default=None, help="Path to initial checkpoint")
 @click.option("--cfg_scale", default=1.5, help="CFG scale during KDD evaluation")
 @click.option("--uncond_prob", default=0.1, help="Probability of dropping label for unconditional training")
-@click.option("--optimizer", default="muon", help="Optimizer")
 def main(run_name, global_batch_size, global_seed, per_gpu_batch_size, num_iterations,
-         learning_rate, sample_every, val_every, kdd_every, save_every, init_ckpt, cfg_scale, uncond_prob, optimizer):
+         learning_rate, sample_every, val_every, kdd_every, save_every, init_ckpt, cfg_scale, uncond_prob):
 
     ddp_rank = int(os.environ["RANK"])
     ddp_local_rank = int(os.environ["LOCAL_RANK"])
@@ -252,41 +251,11 @@ def main(run_name, global_batch_size, global_seed, per_gpu_batch_size, num_itera
     # Wrap in DDP
     model = DDP(model, device_ids=[ddp_local_rank], find_unused_parameters=False)
 
-    if optimizer == "adamw":
-        optimizer = torch.optim.AdamW(
-            model.parameters(),
-            lr=learning_rate,
-            weight_decay=0
-        )
-    elif optimizer == "muon":
-        from muon import Muon
-        adamw_params, muon_params = {}, {}
-        for name, param in model.named_parameters():
-            if param.requires_grad and param.ndim >= 2 and (".bias" not in name):
-                muon_params[name] = param
-            else:
-                adamw_params[name] = param
-
-        for name, param in model.named_parameters():
-            if param.requires_grad:
-                if (param.ndim >= 2) or ((".bias" not in name) or (name.replace(".bias", ".weight") in muon_params)):
-                    # if name has bias, concatenate it with the .weight corresponding to the same layer
-                    if ".bias" in name:
-                        weight_param = muon_params[name.replace(".bias", ".weight")]
-                        bias_param = param
-                        muon_params[name.replace(".bias", ".weight")] = [weight_param, bias_param]
-                    else:
-                        muon_params[name] = param
-                else:
-                    adamw_params[name] = param
-        optimizer = Muon(
-            muon_params=list(muon_params.values()),
-            lr=learning_rate*4,
-            adamw_params=list(adamw_params.values()),
-            adamw_lr=learning_rate,
-            adamw_wd=0,
-            collective_whitening=True
-        )
+    optimizer = torch.optim.AdamW(
+        model.parameters(),
+        lr=learning_rate,
+        weight_decay=0
+    )
 
     enable_cudnn_sdp(True)
     enable_flash_sdp(True)
@@ -366,16 +335,20 @@ def main(run_name, global_batch_size, global_seed, per_gpu_batch_size, num_itera
 
             with torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16):
                 model_kwargs = dict(y=val_labels)
+                pure_noise = torch.randn((data_val.shape[0], 4, 32, 32), device=device)
+                feature_pred = model(pure_noise, **model_kwargs)
+                # we interpolate between the feature_pred and the latents
                 t = torch.rand(data_val.shape[0], device=device)
-                
-                # Inline rectified flow loss
-                b = data_val.shape[0]
                 x_0 = data_val
-                noise = torch.randn_like(x_0)
-                x_t = (1 - t[:, None, None, None]) * x_0 + t[:, None, None, None] * noise
-                v_pred = model(x_t, t, **model_kwargs)
-                v_target = x_0 - x_t
-                loss = F.mse_loss(v_pred, v_target, reduction='none').mean()
+                x_1 = feature_pred
+                x_t = ((1 - t[:, None, None, None]) * x_0) + (t[:, None, None, None] * x_1)
+
+                v = x_1 - x_0
+                
+                # x_t enters model.module.mlp_diffuser, along side t
+                # we want to predict x_0 from x_t, t, and y
+                v_pred = model.module.denoise_step(x_t, t)
+                loss = ((v - v_pred) ** 2).mean()
                 
             val_losses.append(loss.item())
 
@@ -403,6 +376,7 @@ def main(run_name, global_batch_size, global_seed, per_gpu_batch_size, num_itera
             y_i = y[i:i+val_per_gpu_batch_size]
             b_i = z_i.size(0)
             
+            # Create conditional and unconditional inputs for CFG
             z_i = torch.cat([z_i, z_i], dim=0).to(memory_format=torch.channels_last)
             ynull = torch.zeros_like(y_i) + 1000
             y_i = torch.cat([y_i, ynull], dim=0)
@@ -410,29 +384,31 @@ def main(run_name, global_batch_size, global_seed, per_gpu_batch_size, num_itera
             
             with sdpa_kernel([SDPBackend.FLASH_ATTENTION, SDPBackend.CUDNN_ATTENTION, 
                              SDPBackend.MATH, SDPBackend.EFFICIENT_ATTENTION]): 
-                # Apply classifier-free guidance
-                def model_fn_with_cfg(x, t, **kwargs):
-                    half = x.shape[0] // 2
-                    y = kwargs.pop("y")
-                    cond_output = ema(x[:half], t[:half], y=y[:half])
-                    uncond_output = ema(x[half:], t[half:], y=y[half:])
-                    out =  uncond_output + cfg_scale * (cond_output - uncond_output)
-                    return torch.cat([out, out], dim=0)
+                # First predict features using pure noise
+                x_1 = ema(z_i, **model_kwargs)
                 
-                # Inline Euler sampling
-                x = z_i
+                # Split into conditional and unconditional predictions
+                cond_feat, uncond_feat = torch.split(x_1, x_1.shape[0] // 2, dim=0)
+                # Apply classifier-free guidance
+                x_1 = cond_feat#torch.cat([uncond_feat, cond_feat], dim=0)
+                
+                # Inline Euler sampling using denoise_step
+                # x = x_1[:b_i]  # Use only the conditional batch
+                x = x_1
                 steps = 50
                 h = 1.0 / steps
                 
                 for j in range(steps):
                     t = torch.ones(x.shape[0], device=x.device) * (1.0 - j / steps)
-                    v = model_fn_with_cfg(x, t, **model_kwargs)
-                    x = x - h * v
+                    # Use denoise_step to predict velocity
+                    v_pred = ema.denoise_step(x, t)
+                    x = x - h * v_pred
+
                 
-                z_i = x
-                z_i, _ = z_i.chunk(2, dim=0)  # Remove null class samples  
-                z_i = z_i / 0.18215             
+                # Decode the final result
+                z_i = x / 0.18215
                 imgs = decode_fn(z_i)
+            
             imgs = (imgs.clamp(-1,1) + 1) * 127.5
             imgs = imgs.type(torch.uint8)
             all_imgs.append(imgs)
@@ -490,14 +466,21 @@ def main(run_name, global_batch_size, global_seed, per_gpu_batch_size, num_itera
 
             with ctx:
                 model_kwargs = dict(y=labels)
+
+                pure_noise = torch.randn((latents.shape[0], 4, 32, 32), device=device)
+                feature_pred = model(pure_noise, **model_kwargs) # (B, H*W, patch_size ** 2 * out_channels)
+                # we interpolate between the feature_pred and the latents
                 t = torch.rand(latents.shape[0], device=device)
-                
-                # Inline rectified flow loss
                 x_0 = latents
-                x_1 = torch.randn_like(x_0)
+                x_1 = feature_pred
                 x_t = ((1 - t[:, None, None, None]) * x_0) + (t[:, None, None, None] * x_1)
-                v_pred = model(x_t, t, **model_kwargs)
-                loss = ((x_1 - x_0 - v_pred) ** 2).mean()
+
+                v = x_1 - x_0
+                
+                # x_t enters model.module.mlp_diffuser, along side t
+                # we want to predict x_0 from x_t, t, and y
+                v_pred = model.module.denoise_step(x_t, t)
+                loss = ((v - v_pred) ** 2).mean()
 
                 
                 running_loss.append(loss.item())
@@ -527,18 +510,18 @@ def main(run_name, global_batch_size, global_seed, per_gpu_batch_size, num_itera
         if  step % kdd_every == 0:
             kdd_10 = do_kdd_evaluation(1.0)
             kdd_15 = do_kdd_evaluation(1.5)
-            # kdd_20 = do_kdd_evaluation(2.0)
-            # kdd_40 = do_kdd_evaluation(4.0)
+            kdd_20 = do_kdd_evaluation(2.0)
+            kdd_40 = do_kdd_evaluation(4.0)
             if master_process:
                 # print(f"step: {step}, kdd: {kdd:.4f}")
-                wandb.log({"kdd/mmd/1.0": kdd_10, "kdd/mmd/1.5": kdd_15})#, "kdd/mmd/2.0": kdd_20, "kdd/mmd/4.0": kdd_40}, step=step)
+                wandb.log({"kdd/mmd/1.0": kdd_10, "kdd/mmd/1.5": kdd_15, "kdd/mmd/2.0": kdd_20, "kdd/mmd/4.0": kdd_40}, step=step)
 
         # Sample
         if step % sample_every == 0:
             do_sample_grid(step, cfg_scale=1.0)
             do_sample_grid(step, cfg_scale=1.5)
-            # do_sample_grid(step, cfg_scale=2.0)
-            # do_sample_grid(step, cfg_scale=4.0)
+            do_sample_grid(step, cfg_scale=2.0)
+            do_sample_grid(step, cfg_scale=4.0)
 
         # Save Checkpoints
         if master_process and step > 0 and step % save_every == 0:
@@ -560,47 +543,6 @@ def main(run_name, global_batch_size, global_seed, per_gpu_batch_size, num_itera
     if master_process:
         wandb.finish()
     dist.destroy_process_group()
-
-def test_optimizer():
-    # init model
-    device = "cuda:0"
-    model = SiT_models['SiT-B/2']().to(memory_format=torch.channels_last).to(device)
-    # model = torch.compile(model)
-    learning_rate = 0.02
-    from muon import Muon
-    adamw_params, muon_params = {}, {}
-    for name, param in model.named_parameters():
-        if param.requires_grad and param.ndim >= 2 and (".bias" not in name):
-            muon_params[name] = param
-        else:
-            adamw_params[name] = param
-
-    for name, param in model.named_parameters():
-        if param.requires_grad:
-            if (param.ndim >= 2) or ((".bias" not in name) or (name.replace(".bias", ".weight") in muon_params)):
-                # if name has bias, concatenate it with the .weight corresponding to the same layer
-                if ".bias" in name:
-                    weight_param = muon_params[name.replace(".bias", ".weight")]
-                    bias_param = param
-                    muon_params[name.replace(".bias", ".weight")] = [weight_param, bias_param]
-                else:
-                    muon_params[name] = param
-            else:
-                adamw_params[name] = param
-    optimizer = Muon(
-        muon_params=list(muon_params.values()),
-        lr=learning_rate*4,
-        adamw_params=list(adamw_params.values()),
-        adamw_lr=learning_rate,
-        adamw_wd=0,
-        collective_whitening=True
-    )
-    error = model(torch.randn(1, 4, 32, 32).to(device), torch.zeros(1, device=device), torch.randint(0, 1000, (1,)).to(device))
-    # print(error.shape)/
-    error = error.sum()
-    error.backward()
-    optimizer.step()
-
 
 if __name__ == "__main__":
     main()

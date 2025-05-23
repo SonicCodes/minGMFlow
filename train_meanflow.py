@@ -5,7 +5,7 @@ os.environ["WANDB_KEY"] = "017a2798d0b6bc80eecaa69d5f85b84cd4ca556f"
 os.environ["PROJECT"] = "diff-fal"
 os.environ["ENTITY"] = "r21"
 
-from vdit import SiT_models
+from vdit_mflow import SiT_models
 from eval import Eval
 import click
 import torch
@@ -231,8 +231,8 @@ def main(run_name, global_batch_size, global_seed, per_gpu_batch_size, num_itera
     
     # ema model
     ema = copy.deepcopy(model)
-    model = torch.compile(model)
-    ema = torch.compile(ema)
+    # model = torch.compile(model)
+    # ema = torch.compile(ema)
     model = model.to(device)
     ema = ema.to(device)    
     requires_grad(ema, False)
@@ -349,39 +349,44 @@ def main(run_name, global_batch_size, global_seed, per_gpu_batch_size, num_itera
     ctx = torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16)
 
 
-    @torch.no_grad()
-    def do_validation():
-        """
-        Compute a simple validation loss across the entire val_loader.
-        """
-        model.eval()
-        val_losses = []
+    # @torch.no_grad()
+    # def do_validation():
+    #     """
+    #     Compute a simple validation loss across the entire val_loader.
+    #     """
+    #     model.eval()
+    #     val_losses = []
 
-        for val_latents, val_labels in val_loader:
-            val_latents = val_latents.to(device, non_blocking=True).to(memory_format=torch.channels_last)
-            val_labels = val_labels.to(device, non_blocking=True)
+    #     for val_latents, val_labels in val_loader:
+    #         val_latents = val_latents.to(device, non_blocking=True).to(memory_format=torch.channels_last)
+    #         val_labels = val_labels.to(device, non_blocking=True)
 
-            # Scale latents by 0.18215 for stable diffusion training
-            data_val = val_latents * 0.18215
+    #         # Scale latents by 0.18215 for stable diffusion training
+    #         data_val = val_latents * 0.18215
 
-            with torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16):
-                model_kwargs = dict(y=val_labels)
-                t = torch.rand(data_val.shape[0], device=device)
+    #         with torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16):
+    #             model_kwargs = dict(y=val_labels)
+    #             t = torch.rand(data_val.shape[0], device=device)
+    #             r = torch.rand(data_val.shape[0], device=device)
                 
-                # Inline rectified flow loss
-                b = data_val.shape[0]
-                x_0 = data_val
-                noise = torch.randn_like(x_0)
-                x_t = (1 - t[:, None, None, None]) * x_0 + t[:, None, None, None] * noise
-                v_pred = model(x_t, t, **model_kwargs)
-                v_target = x_0 - x_t
-                loss = F.mse_loss(v_pred, v_target, reduction='none').mean()
-                
-            val_losses.append(loss.item())
+    #             # Inline rectified flow loss
+    #             b = data_val.shape[0]
+    #             x_0 = data_val
+    #             noise = torch.randn_like(x_0)
+    #             x_t = (1 - t[:, None, None, None]) * x_0 + t[:, None, None, None] * noise
+    #             # v_pred = model(x_t, t, r, **model_kwargs)
+    #             v_target = x_0 - x_t
 
-        val_loss = np.mean(val_losses)
-        model.train()
-        return val_loss
+    #             u, dudt = torch.autograd.functional.jvp(lambda *vs: model(*vs, y=val_labels), (x_t, t, r), (v_target, torch.ones_like(t, requires_grad=True)+0.0, torch.zeros_like(t, requires_grad=True)+0.0))
+
+    #             u_tgt = v_target - (t - r)[:, None, None, None] * dudt
+    #             loss = ((u - u_tgt.detach())**2).mean()
+                
+    #         val_losses.append(loss.item())
+
+    #     val_loss = np.mean(val_losses)
+    #     model.train()
+    #     return val_loss
 
     @torch.no_grad()
     def do_ema_sample(num_samples, cfg_scale=1.5):
@@ -411,23 +416,25 @@ def main(run_name, global_batch_size, global_seed, per_gpu_batch_size, num_itera
             with sdpa_kernel([SDPBackend.FLASH_ATTENTION, SDPBackend.CUDNN_ATTENTION, 
                              SDPBackend.MATH, SDPBackend.EFFICIENT_ATTENTION]): 
                 # Apply classifier-free guidance
-                def model_fn_with_cfg(x, t, **kwargs):
+                def model_fn_with_cfg(x, t, r, **kwargs):
                     half = x.shape[0] // 2
                     y = kwargs.pop("y")
-                    cond_output = ema(x[:half], t[:half], y=y[:half])
-                    uncond_output = ema(x[half:], t[half:], y=y[half:])
+                    cond_output = ema(x[:half], t[:half], r[:half], y=y[:half])
+                    uncond_output = ema(x[half:], t[half:], r[half:], y=y[half:])
                     out =  uncond_output + cfg_scale * (cond_output - uncond_output)
                     return torch.cat([out, out], dim=0)
                 
                 # Inline Euler sampling
                 x = z_i
-                steps = 50
-                h = 1.0 / steps
+                t = torch.ones(x.shape[0], device=x.device) 
+                r = torch.zeros(x.shape[0], device=x.device) 
+                v = model_fn_with_cfg(x, t, r, **model_kwargs)
+                x = x - v
+                # steps = 50
+                # h = 1.0 / steps
                 
-                for j in range(steps):
-                    t = torch.ones(x.shape[0], device=x.device) * (1.0 - j / steps)
-                    v = model_fn_with_cfg(x, t, **model_kwargs)
-                    x = x - h * v
+                # for j in range(steps):
+                    
                 
                 z_i = x
                 z_i, _ = z_i.chunk(2, dim=0)  # Remove null class samples  
@@ -491,13 +498,22 @@ def main(run_name, global_batch_size, global_seed, per_gpu_batch_size, num_itera
             with ctx:
                 model_kwargs = dict(y=labels)
                 t = torch.rand(latents.shape[0], device=device)
-                
+                r = torch.rand(latents.shape[0], device=device)
                 # Inline rectified flow loss
                 x_0 = latents
                 x_1 = torch.randn_like(x_0)
                 x_t = ((1 - t[:, None, None, None]) * x_0) + (t[:, None, None, None] * x_1)
-                v_pred = model(x_t, t, **model_kwargs)
-                loss = ((x_1 - x_0 - v_pred) ** 2).mean()
+                v_target = x_0 - x_t
+                with sdpa_kernel([SDPBackend.MATH]):
+                    u, dudt = torch.autograd.functional.jvp(lambda *vs: model(*vs, y=labels), 
+                                                            (x_t.detach(), t, r), 
+                                                            (v_target.detach() ,
+                                                                torch.ones_like(t), 
+                                                                torch.zeros_like(t)
+                                                            ), create_graph=True)
+
+                u_tgt = v_target - ((t - r)[:, None, None, None] * dudt)
+                loss = ((u - u_tgt.detach())**2).mean()
 
                 
                 running_loss.append(loss.item())
@@ -518,10 +534,10 @@ def main(run_name, global_batch_size, global_seed, per_gpu_batch_size, num_itera
             }, step=step)
             running_loss = []
         # Validation
-        if  step % val_every == 0:
-            val_loss = do_validation()
-            if master_process:
-                wandb.log({"val/loss": val_loss}, step=step)
+        # if  step % val_every == 0:
+        #     val_loss = do_validation()
+        #     if master_process:
+        #         wandb.log({"val/loss": val_loss}, step=step)
 
         # KDD Evaluation
         if  step % kdd_every == 0:
